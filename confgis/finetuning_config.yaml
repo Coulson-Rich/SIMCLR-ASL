@@ -1,0 +1,17 @@
+# Model configuration
+model:
+  freeze_encoder: false
+  dropout: 0.3
+
+# Training configuration
+training:
+  batch_size: 32
+  num_workers: 4
+  max_epochs: 50
+  learning_rate: 0.001
+  weight_decay: 0.00001
+  early_stopping_patience: 10
+
+# Checkpoint
+checkpoint:
+  path: "checkpoints/simclr-best.ckpt"

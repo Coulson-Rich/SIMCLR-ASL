@@ -1,0 +1,35 @@
+# Data configuration
+data:
+  raw_dir: "data/raw"
+  processed_dir: "data/processed"
+  splits_dir: "data/splits"
+  frame_size: 224
+  target_fps: 30
+
+# Model configuration
+model:
+  video_feature_dim: 2048
+  pose_feature_dim: 512
+  fusion_dim: 2048
+  projection_dim: 128
+  temperature: 0.07
+
+# Training configuration
+training:
+  batch_size: 32
+  num_workers: 4
+  max_epochs: 100
+  learning_rate: 0.0003
+  weight_decay: 0.000001
+  
+# Augmentation configuration
+augmentations:
+  temporal_crop_min: 0.7
+  temporal_crop_max: 0.95
+  temporal_jitter_max: 3
+  pose_noise_std: 0.01
+  color_jitter:
+    brightness: 0.2
+    contrast: 0.2
+    saturation: 0.1
+    hue: 0.05
