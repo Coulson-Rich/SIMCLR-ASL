@@ -1,0 +1,8 @@
+# Slurm results
+slurm-*.out
+slurm-*.err
+*.out
+*.err
+
+# Data folder
+data/
