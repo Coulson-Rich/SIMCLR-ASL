@@ -29,10 +29,13 @@ class VideoEncoder(nn.Module):
     
     def __init__(self, pretrained=True):
         super().__init__()
-        # Use ResNet3D for video encoding
-        # For simplicity, use 2D ResNet with temporal pooling
-        self.cnn = torch.hub.load('pytorch/vision:v0.10.0', 
-                                   'resnet50', pretrained=pretrained)
+        # Use ResNet50 for video encoding with temporal pooling
+        from torchvision.models import resnet50, ResNet50_Weights
+        
+        if pretrained:
+            self.cnn = resnet50(weights=ResNet50_Weights.DEFAULT)
+        else:
+            self.cnn = resnet50()
         
         # Remove classification head
         self.encoder = nn.Sequential(*list(self.cnn.children())[:-1])
@@ -74,7 +77,7 @@ class PoseEncoder(nn.Module):
     
     def forward(self, x):
         """
-        x: (batch, time_steps, 132)
+        x: (batch, time_steps, pose_dim)
         Returns: (batch, output_dim)
         """
         _, (h_n, _) = self.lstm(x)
@@ -88,10 +91,10 @@ class MultimodalEncoder(nn.Module):
     """Combines video and pose encoders."""
     
     def __init__(self, video_feature_dim=2048, pose_feature_dim=512, 
-                 fusion_dim=2048):
+                 fusion_dim=2048, pose_input_dim=132):
         super().__init__()
         self.video_encoder = VideoEncoder(pretrained=True)
-        self.pose_encoder = PoseEncoder(output_dim=pose_feature_dim)
+        self.pose_encoder = PoseEncoder(input_dim=pose_input_dim, output_dim=pose_feature_dim)
         
         # Fusion layer
         self.fusion = nn.Sequential(
@@ -104,7 +107,7 @@ class MultimodalEncoder(nn.Module):
     def forward(self, video_frames, pose_sequence):
         """
         video_frames: (batch, time, c, h, w)
-        pose_sequence: (batch, time, 132)
+        pose_sequence: (batch, time, pose_dim)
         """
         video_features = self.video_encoder(video_frames)
         pose_features = self.pose_encoder(pose_sequence)
@@ -139,7 +142,7 @@ class NTXentLoss(nn.Module):
         # Similarity matrix
         similarity_matrix = torch.matmul(representations, representations.T)
         
-        # Create labels (diagonal elements are positives)
+        # Create positive pair mask
         mask = torch.eye(batch_size, dtype=torch.bool, device=z_i.device)
         mask = torch.cat([
             torch.cat([torch.zeros_like(mask), mask], dim=1),
@@ -149,27 +152,26 @@ class NTXentLoss(nn.Module):
         # Apply temperature
         similarity_matrix = similarity_matrix / self.temperature
         
-        # Loss computation
+        # Extract positive and negative similarities
         pos_mask = mask
-        neg_mask = ~mask
+        neg_mask = ~mask & ~torch.eye(2*batch_size, dtype=torch.bool, device=z_i.device)
         
-        pos = similarity_matrix[pos_mask].view(batch_size, 1)
-        neg = similarity_matrix[neg_mask].view(batch_size, -1)
+        # Compute loss
+        positives = similarity_matrix[pos_mask].view(2*batch_size, 1)
+        negatives = similarity_matrix[neg_mask].view(2*batch_size, -1)
         
-        logits = torch.cat([pos, neg], dim=1)
-        labels = torch.zeros(batch_size, dtype=torch.long, device=z_i.device)
+        logits = torch.cat([positives, negatives], dim=1)
+        labels = torch.zeros(2*batch_size, dtype=torch.long, device=z_i.device)
         
         loss = F.cross_entropy(logits, labels)
         return loss
 
 
-class ISLRDataset(Dataset):
-    """PyTorch Dataset for ISLR."""
+class AUTSLDataset(Dataset):
+    """PyTorch Dataset for AUTSL."""
     
-    def __init__(self, metadata, processed_dir='data/processed', 
-                 transform=None, split='train'):
+    def __init__(self, metadata, transform=None, split='train'):
         self.metadata = metadata
-        self.processed_dir = Path(processed_dir)
         self.transform = transform
         self.split = split
     
@@ -178,21 +180,27 @@ class ISLRDataset(Dataset):
     
     def __getitem__(self, idx):
         item = self.metadata[idx]
-        sign_name = item['sign_name']
-        video_id = item['video_id']
         
-        video_dir = self.processed_dir / sign_name / str(video_id)
+        # Load video frames
+        cap = cv2.VideoCapture(item['video_path'])
+        frames = []
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frame = cv2.resize(frame, (224, 224))
+            frames.append(frame)
+        cap.release()
         
-        # Load frames
-        frame_files = sorted(video_dir.glob('frame_*.jpg'))
-        frames = [cv2.imread(str(f)) for f in frame_files]
+        # Load pre-extracted pose
+        skel_path = Path(item['skel_path'])
+        if skel_path.suffix == '.npy':
+            pose_sequence = np.load(skel_path)
+        else:
+            with open(skel_path, 'rb') as f:
+                pose_sequence = pickle.load(f)
         
-        # Load pose sequence
-        pose_path = video_dir / 'pose_sequence.pkl'
-        with open(pose_path, 'rb') as f:
-            pose_sequence = pickle.load(f)
-        
-        # Ensure pose_sequence is proper length
+        # Ensure matching lengths
         min_len = min(len(frames), len(pose_sequence))
         frames = frames[:min_len]
         pose_sequence = pose_sequence[:min_len]
@@ -206,15 +214,20 @@ class ISLRDataset(Dataset):
                 'frames2': frames2,
                 'pose1': pose1,
                 'pose2': pose2,
-                'sign': sign_name
+                'class_id': item['class_id']
             }
         else:
             # For evaluation, return single view
+            frames_tensor = torch.stack([
+                torch.from_numpy(f).permute(2, 0, 1).float() / 255.0 
+                for f in frames
+            ])
+            pose_tensor = torch.from_numpy(pose_sequence).float()
+            
             return {
-                'frames': torch.stack([torch.from_numpy(f).permute(2, 0, 1).float() 
-                                       for f in frames]),
-                'pose': torch.from_numpy(pose_sequence).float(),
-                'sign': sign_name
+                'frames': frames_tensor,
+                'pose': pose_tensor,
+                'class_id': item['class_id']
             }
 
 
@@ -263,26 +276,9 @@ class SimCLRLightning(pl.LightningModule):
             weight_decay=1e-6
         )
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=200
+            optimizer, T_max=100
         )
         return {
             'optimizer': optimizer,
             'lr_scheduler': scheduler
         }
-    
-    def get_representations(self, dataloader):
-        """Extract representations for downstream tasks."""
-        representations = []
-        labels = []
-        
-        self.eval()
-        with torch.no_grad():
-            for batch in dataloader:
-                frames = batch['frames'].to(self.device)
-                pose = batch['pose'].to(self.device)
-                h, _ = self(frames, pose)
-                representations.append(h.cpu().numpy())
-                labels.extend(batch['sign'])
-        
-        import numpy as np
-        return np.concatenate(representations), labels

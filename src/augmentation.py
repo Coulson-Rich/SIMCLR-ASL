@@ -42,6 +42,11 @@ class SignLanguageAugmentations:
     
     def spatial_transforms(self, frame):
         """Apply spatial augmentations to individual frame."""
+        # Convert numpy array to PIL Image for transforms
+        from PIL import Image
+        if isinstance(frame, np.ndarray):
+            frame = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        
         # Random crop
         if random.random() > 0.5:
             frame = TF.center_crop(frame, (int(self.frame_size * 0.9), 
@@ -66,6 +71,10 @@ class SignLanguageAugmentations:
         if random.random() > 0.7:
             frame = TF.gaussian_blur(frame, kernel_size=5)
         
+        # Convert back to numpy array
+        frame = np.array(frame)
+        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        
         return frame
     
     def pose_augmentation(self, pose_sequence, noise_std=0.01):
@@ -75,12 +84,10 @@ class SignLanguageAugmentations:
         """
         augmented = pose_sequence.copy()
         
-        # Add Gaussian noise to xy coordinates (but not z or visibility)
-        for frame_idx in range(len(augmented)):
-            for landmark_idx in range(33):  # 33 landmarks
-                # Add noise to x, y (skip z, visibility)
-                augmented[frame_idx, landmark_idx*4:landmark_idx*4+2] += \
-                    np.random.normal(0, noise_std, 2)
+        # Add Gaussian noise to coordinates
+        # Adjust based on actual AUTSL pose format
+        noise = np.random.normal(0, noise_std, augmented.shape)
+        augmented = augmented + noise
         
         # Temporal smoothing (running average to handle jitter)
         if random.random() > 0.7:
@@ -100,12 +107,14 @@ class SignLanguageAugmentations:
         # Augmentation 1
         frames1 = self.temporal_crop(video_frames)
         frames1 = self.temporal_jitter(frames1)
-        pose1 = self.pose_augmentation(pose_sequence[:len(video_frames)])
+        frames1 = [self.spatial_transforms(f) for f in frames1]
+        pose1 = self.pose_augmentation(pose_sequence[:len(frames1)])
         
         # Augmentation 2 (different strategy)
         frames2 = self.temporal_crop(video_frames)
         frames2 = self.temporal_jitter(frames2)
-        pose2 = self.pose_augmentation(pose_sequence[:len(video_frames)])
+        frames2 = [self.spatial_transforms(f) for f in frames2]
+        pose2 = self.pose_augmentation(pose_sequence[:len(frames2)])
         
         return frames1, frames2, pose1, pose2
 

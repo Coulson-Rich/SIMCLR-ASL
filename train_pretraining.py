@@ -3,37 +3,23 @@ from torch.utils.data import DataLoader
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 import pickle
-from pathlib import Path
 
-from src.simclr_model import (
-    ISLRDataset, MultimodalEncoder, SimCLRLightning, ContrastiveTransform
-)
-from src.utils import create_dataset_splits
+from src.simclr_model import AUTSLDataset, MultimodalEncoder, SimCLRLightning
+from src.augmentations import ContrastiveTransform
 
 
 def train_simclr():
-    # Create dataset splits
-    splits = create_dataset_splits(
-        'data/processed/metadata.pkl',
-        output_dir='data/splits'
-    )
+    # Load metadata
+    with open('data/train_metadata.pkl', 'rb') as f:
+        train_metadata = pickle.load(f)
+    with open('data/val_metadata.pkl', 'rb') as f:
+        val_metadata = pickle.load(f)
     
     # Initialize dataset
     transform = ContrastiveTransform(frame_size=224)
     
-    train_dataset = ISLRDataset(
-        splits['train'],
-        processed_dir='data/processed',
-        transform=transform,
-        split='train'
-    )
-    
-    val_dataset = ISLRDataset(
-        splits['val'],
-        processed_dir='data/processed',
-        transform=transform,
-        split='val'
-    )
+    train_dataset = AUTSLDataset(train_metadata, transform=transform, split='train')
+    val_dataset = AUTSLDataset(val_metadata, transform=transform, split='val')
     
     # Create dataloaders
     train_loader = DataLoader(
@@ -56,7 +42,8 @@ def train_simclr():
     encoder = MultimodalEncoder(
         video_feature_dim=2048,
         pose_feature_dim=512,
-        fusion_dim=2048
+        fusion_dim=2048,
+        pose_input_dim=132  # Adjust based on AUTSL pose format
     )
     
     model = SimCLRLightning(
@@ -85,7 +72,8 @@ def train_simclr():
     # Trainer
     trainer = pl.Trainer(
         max_epochs=100,
-        gpus=1 if torch.cuda.is_available() else 0,
+        accelerator='gpu' if torch.cuda.is_available() else 'cpu',
+        devices=1,
         callbacks=[checkpoint_callback, early_stop_callback],
         log_every_n_steps=10,
         default_root_dir='./lightning_logs'

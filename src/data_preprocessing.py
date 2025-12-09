@@ -1,152 +1,177 @@
 import os
 import cv2
 import numpy as np
-import mediapipe as mp
+import pandas as pd
 from pathlib import Path
 from tqdm import tqdm
 import pickle
 
-class VideoPreprocessor:
-    """Extract frames and pose keypoints from sign language videos."""
+class AUTSLDataLoader:
+    """Load AUTSL videos and pre-extracted pose keypoints."""
     
-    def __init__(self, output_dir='data/processed', target_fps=30, target_size=(224, 224)):
-        self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.target_fps = target_fps
-        self.target_size = target_size
+    def __init__(self, autsl_root='/home/ccoulson/groups/grp_asl_classification/nobackup/archive/AUTSL'):
+        self.autsl_root = Path(autsl_root)
         
-        # Initialize MediaPipe Pose
-        self.mp_pose = mp.solutions.pose
-        self.pose = self.mp_pose.Pose(
-            static_image_mode=False,
-            model_complexity=1,
-            smooth_landmarks=True,
-            min_detection_confidence=0.5
-        )
-        self.mp_drawing = mp.solutions.drawing_utils
+        # Define paths
+        self.class_mapping_path = self.autsl_root / 'class_ids' / 'SignList_ClassId_TR_EN.csv'
+        
+        self.train_video_dir = self.autsl_root / 'train' / 'train'
+        self.val_video_dir = self.autsl_root / 'validate' / 'validate'
+        self.test_video_dir = self.autsl_root / 'test' / 'test'
+        
+        self.train_skel_dir = self.autsl_root / 'train' / 'train_skel'
+        self.val_skel_dir = self.autsl_root / 'validate' / 'validate_skel'
+        self.test_skel_dir = self.autsl_root / 'test' / 'test_skel'
+        
+        self.train_labels_path = self.autsl_root / 'train' / 'train_labels.csv'
+        self.val_labels_path = self.autsl_root / 'validate' / 'ground_truth.csv'
+        self.test_labels_path = self.autsl_root / 'test' / 'ground_truth.csv'
+        
+        # Load class mapping
+        self.class_mapping = self._load_class_mapping()
+        
+    def _load_class_mapping(self):
+        """Load sign class mapping from CSV."""
+        df = pd.read_csv(self.class_mapping_path)
+        # Returns dict: {ClassId: {'Turkish': ..., 'English': ...}}
+        return {
+            row['ClassId']: {'Turkish': row['Turkish'], 'English': row['English']}
+            for _, row in df.iterrows()
+        }
     
-    def extract_frames(self, video_path, sign_name, max_frames=None):
-        """Extract frames from video and save as images."""
+    def _load_labels(self, split='train'):
+        """Load labels for a given split."""
+        if split == 'train':
+            df = pd.read_csv(self.train_labels_path)
+        elif split == 'val':
+            df = pd.read_csv(self.val_labels_path)
+        elif split == 'test':
+            df = pd.read_csv(self.test_labels_path)
+        else:
+            raise ValueError(f"Unknown split: {split}")
+        
+        # Assuming CSV has columns: video_id, class_id (or similar)
+        # Adjust column names based on actual AUTSL format
+        return {row[0]: row[1] for row in df.values}  # {video_id: class_id}
+    
+    def load_video_frames(self, video_path, target_size=(224, 224), max_frames=90):
+        """Load and resize video frames."""
         cap = cv2.VideoCapture(str(video_path))
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        
-        # Calculate frame sampling rate
-        sample_rate = max(1, int(fps / self.target_fps))
-        
         frames = []
-        frame_idx = 0
         
-        while cap.isOpened():
+        while cap.isOpened() and len(frames) < max_frames:
             ret, frame = cap.read()
             if not ret:
                 break
-            
-            if frame_idx % sample_rate == 0:
-                # Resize frame
-                frame = cv2.resize(frame, self.target_size)
-                frames.append(frame)
-                
-                if max_frames and len(frames) >= max_frames:
-                    break
-            
-            frame_idx += 1
+            frame = cv2.resize(frame, target_size)
+            frames.append(frame)
         
         cap.release()
         return frames
     
-    def extract_pose_keypoints(self, frame):
-        """Extract pose landmarks from a single frame using MediaPipe."""
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = self.pose.process(rgb_frame)
+    def load_pose_keypoints(self, skel_file_path):
+        """Load pre-extracted pose keypoints from AUTSL skeleton files."""
+        # AUTSL skeleton files are typically .npy or .pkl format
+        # Adjust based on actual AUTSL skeleton format
         
-        if results.pose_landmarks:
-            # Extract 33 landmarks (x, y, z, visibility)
-            landmarks = []
-            for landmark in results.pose_landmarks.landmark:
-                landmarks.extend([landmark.x, landmark.y, landmark.z, landmark.visibility])
-            return np.array(landmarks, dtype=np.float32)  # Shape: (132,)
+        if skel_file_path.suffix == '.npy':
+            pose_sequence = np.load(skel_file_path)
+        elif skel_file_path.suffix == '.pkl':
+            with open(skel_file_path, 'rb') as f:
+                pose_sequence = pickle.load(f)
         else:
-            # Return zeros if no pose detected
-            return np.zeros((132,), dtype=np.float32)
+            raise ValueError(f"Unsupported skeleton file format: {skel_file_path.suffix}")
+        
+        # Expected shape: (num_frames, num_keypoints * coordinates)
+        # AUTSL may have different format - adjust accordingly
+        return pose_sequence
     
-    def process_video(self, video_path, sign_name, video_id):
-        """Process a single video: extract frames and pose keypoints."""
-        video_output_dir = self.output_dir / sign_name / str(video_id)
-        video_output_dir.mkdir(parents=True, exist_ok=True)
+    def create_dataset_metadata(self, split='train'):
+        """Create metadata for dataset split."""
+        if split == 'train':
+            video_dir = self.train_video_dir
+            skel_dir = self.train_skel_dir
+        elif split == 'val':
+            video_dir = self.val_video_dir
+            skel_dir = self.val_skel_dir
+        elif split == 'test':
+            video_dir = self.test_video_dir
+            skel_dir = self.test_skel_dir
+        else:
+            raise ValueError(f"Unknown split: {split}")
         
-        # Extract frames
-        frames = self.extract_frames(video_path, sign_name, max_frames=90)
+        # Load labels
+        labels = self._load_labels(split)
         
-        if len(frames) == 0:
-            print(f"Warning: No frames extracted from {video_path}")
-            return None
+        metadata = []
+        video_files = sorted(video_dir.glob('*.mp4'))
         
-        # Extract pose keypoints for all frames
-        pose_sequence = []
-        frame_files = []
-        
-        for frame_idx, frame in enumerate(frames):
-            # Save frame
-            frame_path = video_output_dir / f'frame_{frame_idx:04d}.jpg'
-            cv2.imwrite(str(frame_path), frame)
-            frame_files.append(str(frame_path))
+        for video_path in tqdm(video_files, desc=f"Loading {split} metadata"):
+            video_id = video_path.stem
             
-            # Extract pose
-            pose_keypoints = self.extract_pose_keypoints(frame)
-            pose_sequence.append(pose_keypoints)
-        
-        # Save pose sequence
-        pose_path = video_output_dir / 'pose_sequence.pkl'
-        with open(pose_path, 'wb') as f:
-            pickle.dump(np.array(pose_sequence), f)
-        
-        # Save metadata
-        metadata = {
-            'video_id': video_id,
-            'sign_name': sign_name,
-            'num_frames': len(frames),
-            'frame_files': frame_files,
-            'pose_path': str(pose_path)
-        }
-        
-        return metadata
-    
-    def process_dataset(self, raw_data_dir):
-        """Process entire dataset."""
-        raw_data_dir = Path(raw_data_dir)
-        all_metadata = []
-        
-        # Assuming directory structure: raw_data_dir/sign_name/video.mp4
-        for sign_dir in tqdm(raw_data_dir.iterdir(), desc="Processing signs"):
-            if not sign_dir.is_dir():
+            # Find corresponding skeleton file
+            skel_path = skel_dir / f"{video_id}.npy"  # Adjust extension if needed
+            if not skel_path.exists():
+                skel_path = skel_dir / f"{video_id}.pkl"
+            
+            if not skel_path.exists():
+                print(f"Warning: No skeleton file found for {video_id}")
                 continue
             
-            sign_name = sign_dir.name
-            video_id = 0
+            # Get class label
+            class_id = labels.get(video_id, None)
+            if class_id is None:
+                print(f"Warning: No label found for {video_id}")
+                continue
             
-            for video_file in sign_dir.glob('*.mp4'):
-                metadata = self.process_video(video_file, sign_name, video_id)
-                if metadata:
-                    all_metadata.append(metadata)
-                video_id += 1
+            metadata.append({
+                'video_id': video_id,
+                'video_path': str(video_path),
+                'skel_path': str(skel_path),
+                'class_id': class_id,
+                'split': split
+            })
         
-        # Save all metadata
-        metadata_path = self.output_dir / 'metadata.pkl'
-        with open(metadata_path, 'wb') as f:
-            pickle.dump(all_metadata, f)
-        
-        print(f"Processed {len(all_metadata)} videos")
-        return all_metadata
-
-
-# Run preprocessing
-if __name__ == '__main__':
-    preprocessor = VideoPreprocessor(
-        output_dir='data/processed',
-        target_fps=30,
-        target_size=(224, 224)
-    )
+        print(f"✓ Loaded {len(metadata)} samples for {split} split")
+        return metadata
     
-    metadata = preprocessor.process_dataset('data/raw')
-    print(f"Total videos processed: {len(metadata)}")
+    def save_metadata(self, output_dir='data'):
+        """Create and save metadata for all splits."""
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        metadata = {
+            'train': self.create_dataset_metadata('train'),
+            'val': self.create_dataset_metadata('val'),
+            'test': self.create_dataset_metadata('test')
+        }
+        
+        # Save metadata
+        for split, data in metadata.items():
+            output_path = output_dir / f'{split}_metadata.pkl'
+            with open(output_path, 'wb') as f:
+                pickle.dump(data, f)
+            print(f"✓ Saved {split} metadata to {output_path}")
+        
+        # Save class mapping
+        class_mapping_path = output_dir / 'class_mapping.pkl'
+        with open(class_mapping_path, 'wb') as f:
+            pickle.dump(self.class_mapping, f)
+        print(f"✓ Saved class mapping to {class_mapping_path}")
+        
+        return metadata
+
+
+# Run data loading
+if __name__ == '__main__':
+    loader = AUTSLDataLoader()
+    metadata = loader.save_metadata(output_dir='data')
+    
+    print("\n" + "="*60)
+    print("DATASET SUMMARY")
+    print("="*60)
+    print(f"Train samples: {len(metadata['train'])}")
+    print(f"Val samples: {len(metadata['val'])}")
+    print(f"Test samples: {len(metadata['test'])}")
+    print(f"Total classes: {len(loader.class_mapping)}")
+    print("="*60)
