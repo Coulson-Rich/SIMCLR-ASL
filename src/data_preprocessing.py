@@ -6,6 +6,7 @@ from pathlib import Path
 from tqdm import tqdm
 import pickle
 
+
 class AUTSLDataLoader:
     """Load AUTSL videos and pre-extracted pose keypoints."""
     
@@ -16,15 +17,15 @@ class AUTSLDataLoader:
         self.class_mapping_path = self.autsl_root / 'class_ids' / 'SignList_ClassId_TR_EN.csv'
         
         self.train_video_dir = self.autsl_root / 'train' / 'train'
-        self.val_video_dir = self.autsl_root / 'validate' / 'validate'
+        self.val_video_dir = self.autsl_root / 'val' / 'val'
         self.test_video_dir = self.autsl_root / 'test' / 'test'
         
         self.train_skel_dir = self.autsl_root / 'train' / 'train_skel'
-        self.val_skel_dir = self.autsl_root / 'validate' / 'validate_skel'
+        self.val_skel_dir = self.autsl_root / 'val' / 'val_skel'
         self.test_skel_dir = self.autsl_root / 'test' / 'test_skel'
         
         self.train_labels_path = self.autsl_root / 'train' / 'train_labels.csv'
-        self.val_labels_path = self.autsl_root / 'validate' / 'ground_truth.csv'
+        self.val_labels_path = self.autsl_root / 'val' / 'ground_truth.csv'
         self.test_labels_path = self.autsl_root / 'test' / 'ground_truth.csv'
         
         # Load class mapping
@@ -34,8 +35,13 @@ class AUTSLDataLoader:
         """Load sign class mapping from CSV."""
         df = pd.read_csv(self.class_mapping_path)
         # Returns dict: {ClassId: {'Turkish': ..., 'English': ...}}
+        # Handles different CSV column name formats
+        tr_col = 'TR' if 'TR' in df.columns else 'Turkish'
+        en_col = 'EN' if 'EN' in df.columns else 'English'
+        id_col = 'ClassId' if 'ClassId' in df.columns else df.columns[0]
+        
         return {
-            row['ClassId']: {'Turkish': row['Turkish'], 'English': row['English']}
+            row[id_col]: {'Turkish': row[tr_col], 'English': row[en_col]}
             for _, row in df.iterrows()
         }
     
@@ -49,10 +55,14 @@ class AUTSLDataLoader:
             df = pd.read_csv(self.test_labels_path)
         else:
             raise ValueError(f"Unknown split: {split}")
-        
-        # Assuming CSV has columns: video_id, class_id (or similar)
-        # Adjust column names based on actual AUTSL format
-        return {row[0]: row[1] for row in df.values}  # {video_id: class_id}
+
+        # Use first two columns: sample_id and class_id
+        # Adjust if CSV has explicit column names
+        id_col = df.columns[0]      # e.g. 'sample_id'
+        class_col = df.columns[1]   # e.g. 'class_id'
+
+        # Keys like 'signer0_sample600'
+        return {row[id_col]: row[class_col] for _, row in df.iterrows()}
     
     def load_video_frames(self, video_path, target_size=(224, 224), max_frames=90):
         """Load and resize video frames."""
@@ -71,8 +81,7 @@ class AUTSLDataLoader:
     
     def load_pose_keypoints(self, skel_file_path):
         """Load pre-extracted pose keypoints from AUTSL skeleton files."""
-        # AUTSL skeleton files are typically .npy or .pkl format
-        # Adjust based on actual AUTSL skeleton format
+        skel_file_path = Path(skel_file_path)
         
         if skel_file_path.suffix == '.npy':
             pose_sequence = np.load(skel_file_path)
@@ -82,9 +91,15 @@ class AUTSLDataLoader:
         else:
             raise ValueError(f"Unsupported skeleton file format: {skel_file_path.suffix}")
         
-        # Expected shape: (num_frames, num_keypoints * coordinates)
-        # AUTSL may have different format - adjust accordingly
+        # Handle shape: if [T, num_keypoints, 4], flatten to [T, num_keypoints*4]
+        if pose_sequence.ndim == 3:
+            T, num_kpts, num_vals = pose_sequence.shape
+            pose_sequence = pose_sequence.reshape(T, num_kpts * num_vals)
+        
+        # Expected shape after this: (num_frames, pose_dim)
+        # e.g., (90, 132) for 33 keypoints × 4 values
         return pose_sequence
+
     
     def create_dataset_metadata(self, split='train'):
         """Create metadata for dataset split."""
@@ -99,39 +114,42 @@ class AUTSLDataLoader:
             skel_dir = self.test_skel_dir
         else:
             raise ValueError(f"Unknown split: {split}")
-        
-        # Load labels
+
         labels = self._load_labels(split)
-        
         metadata = []
         video_files = sorted(video_dir.glob('*.mp4'))
-        
+
         for video_path in tqdm(video_files, desc=f"Loading {split} metadata"):
-            video_id = video_path.stem
+            stem = video_path.stem              # e.g. 'signer10_sample151_color' or 'signer10_sample151_depth'
             
-            # Find corresponding skeleton file
-            skel_path = skel_dir / f"{video_id}.npy"  # Adjust extension if needed
-            if not skel_path.exists():
-                skel_path = skel_dir / f"{video_id}.pkl"
+            # Extract base_id by removing '_color' or '_depth' suffix
+            if stem.endswith('_color'):
+                base_id = stem[:-len('_color')]  # 'signer10_sample151'
+            elif stem.endswith('_depth'):
+                base_id = stem[:-len('_depth')]  # 'signer10_sample151'
+            else:
+                base_id = stem
+
+            # USE ONLY COLOR LANDMARKS
+            # Skeleton filenames are: base_id + '_color_landmarks.npy'
+            skel_path = skel_dir / f"{base_id}_color_landmarks.npy"
             
             if not skel_path.exists():
-                print(f"Warning: No skeleton file found for {video_id}")
                 continue
-            
-            # Get class label
-            class_id = labels.get(video_id, None)
+
+            # Labels are keyed by base_id
+            class_id = labels.get(base_id, None)
             if class_id is None:
-                print(f"Warning: No label found for {video_id}")
                 continue
-            
+
             metadata.append({
-                'video_id': video_id,
+                'video_id': base_id,
                 'video_path': str(video_path),
                 'skel_path': str(skel_path),
                 'class_id': class_id,
                 'split': split
             })
-        
+
         print(f"✓ Loaded {len(metadata)} samples for {split} split")
         return metadata
     

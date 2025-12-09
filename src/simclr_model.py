@@ -7,6 +7,7 @@ from pathlib import Path
 import pickle
 import cv2
 import numpy as np
+import pandas as pd
 from tqdm import tqdm
 
 class ProjectionHead(nn.Module):
@@ -27,15 +28,12 @@ class ProjectionHead(nn.Module):
 class VideoEncoder(nn.Module):
     """Temporal encoder for video frames using 3D CNN."""
     
-    def __init__(self, pretrained=True):
+    def __init__(self, pretrained=False):
         super().__init__()
-        # Use ResNet50 for video encoding with temporal pooling
-        from torchvision.models import resnet50, ResNet50_Weights
+        from torchvision.models import resnet50
         
-        if pretrained:
-            self.cnn = resnet50(weights=ResNet50_Weights.DEFAULT)
-        else:
-            self.cnn = resnet50()
+        # No internet-required weights; random init
+        self.cnn = resnet50(weights=None)
         
         # Remove classification head
         self.encoder = nn.Sequential(*list(self.cnn.children())[:-1])
@@ -63,7 +61,7 @@ class VideoEncoder(nn.Module):
 class PoseEncoder(nn.Module):
     """Encoder for pose keypoint sequences."""
     
-    def __init__(self, input_dim=132, hidden_dim=256, output_dim=512):
+    def __init__(self, input_dim=2172, hidden_dim=256, output_dim=512):
         super().__init__()
         self.lstm = nn.LSTM(
             input_size=input_dim,
@@ -80,9 +78,14 @@ class PoseEncoder(nn.Module):
         x: (batch, time_steps, pose_dim)
         Returns: (batch, output_dim)
         """
+        # Handle edge cases
+        if x.dim() == 4:
+            x = x.squeeze(1)
+        if x.dim() != 3:
+            raise ValueError(f"PoseEncoder expects 3D input [batch, time, pose_dim], got shape {x.shape}")
+        
         _, (h_n, _) = self.lstm(x)
-        # h_n: (num_layers, batch, hidden_dim)
-        features = h_n[-1]  # Last layer hidden state
+        features = h_n[-1]
         features = self.fc(features)
         return features
 
@@ -91,9 +94,9 @@ class MultimodalEncoder(nn.Module):
     """Combines video and pose encoders."""
     
     def __init__(self, video_feature_dim=2048, pose_feature_dim=512, 
-                 fusion_dim=2048, pose_input_dim=132):
+                 fusion_dim=2048, pose_input_dim=2172):
         super().__init__()
-        self.video_encoder = VideoEncoder(pretrained=True)
+        self.video_encoder = VideoEncoder(pretrained=False)
         self.pose_encoder = PoseEncoder(input_dim=pose_input_dim, output_dim=pose_feature_dim)
         
         # Fusion layer
@@ -122,9 +125,10 @@ class MultimodalEncoder(nn.Module):
 class NTXentLoss(nn.Module):
     """NT-Xent (Normalized Temperature-scaled Cross Entropy) Loss."""
     
-    def __init__(self, temperature=0.07):
+    def __init__(self, temperature=0.5):
         super().__init__()
         self.temperature = temperature
+        self.criterion = nn.CrossEntropyLoss(reduction="sum")
     
     def forward(self, z_i, z_j):
         """
@@ -136,34 +140,31 @@ class NTXentLoss(nn.Module):
         z_i = F.normalize(z_i, dim=1)
         z_j = F.normalize(z_j, dim=1)
         
-        # Concatenate representations
-        representations = torch.cat([z_i, z_j], dim=0)
+        # Concatenate [z_i, z_j] -> shape [2*batch_size, feature_dim]
+        z = torch.cat([z_i, z_j], dim=0)
         
-        # Similarity matrix
-        similarity_matrix = torch.matmul(representations, representations.T)
+        # Compute similarity matrix: [2*batch_size, 2*batch_size]
+        similarity_matrix = torch.mm(z, z.T) / self.temperature
         
-        # Create positive pair mask
-        mask = torch.eye(batch_size, dtype=torch.bool, device=z_i.device)
-        mask = torch.cat([
-            torch.cat([torch.zeros_like(mask), mask], dim=1),
-            torch.cat([mask, torch.zeros_like(mask)], dim=1)
-        ], dim=0)
+        # Create mask for positive pairs
+        batch_size_2x = 2 * batch_size
+        mask = torch.eye(batch_size_2x, dtype=torch.bool, device=z.device)
         
-        # Apply temperature
-        similarity_matrix = similarity_matrix / self.temperature
+        # Get positive sample indices
+        positives = torch.cat([
+            torch.arange(batch_size, batch_size_2x),
+            torch.arange(0, batch_size)
+        ]).to(z.device)
         
-        # Extract positive and negative similarities
-        pos_mask = mask
-        neg_mask = ~mask & ~torch.eye(2*batch_size, dtype=torch.bool, device=z_i.device)
+        # Remove diagonal (self-similarity)
+        similarity_matrix.masked_fill_(mask, -1e9)
+        
+        # Labels for cross entropy: index of positive sample
+        labels = positives
         
         # Compute loss
-        positives = similarity_matrix[pos_mask].view(2*batch_size, 1)
-        negatives = similarity_matrix[neg_mask].view(2*batch_size, -1)
+        loss = self.criterion(similarity_matrix, labels) / batch_size_2x
         
-        logits = torch.cat([positives, negatives], dim=1)
-        labels = torch.zeros(2*batch_size, dtype=torch.long, device=z_i.device)
-        
-        loss = F.cross_entropy(logits, labels)
         return loss
 
 
@@ -200,6 +201,17 @@ class AUTSLDataset(Dataset):
             with open(skel_path, 'rb') as f:
                 pose_sequence = pickle.load(f)
         
+        # Flatten if 3D: [T, num_kpts, 4] -> [T, num_kpts*4]
+        if pose_sequence.ndim == 3:
+            T, num_kpts, num_vals = pose_sequence.shape
+            pose_sequence = pose_sequence.reshape(T, num_kpts * num_vals)
+        
+        # **FIX NaNs with interpolation**
+        # Convert to pandas for easier interpolation, then back to numpy
+        pose_sequence = pd.DataFrame(pose_sequence).interpolate(
+            method='linear', axis=0, limit_direction='both'
+        ).fillna(0).values
+        
         # Ensure matching lengths
         min_len = min(len(frames), len(pose_sequence))
         frames = frames[:min_len]
@@ -234,8 +246,8 @@ class AUTSLDataset(Dataset):
 class SimCLRLightning(pl.LightningModule):
     """PyTorch Lightning module for SimCLR training."""
     
-    def __init__(self, encoder, projection_dim=128, learning_rate=3e-4, 
-                 temperature=0.07):
+    def __init__(self, encoder, projection_dim=128, learning_rate=1e-4, 
+                 temperature=0.5):
         super().__init__()
         self.encoder = encoder
         self.projection_head = ProjectionHead(
@@ -257,7 +269,7 @@ class SimCLRLightning(pl.LightningModule):
         
         loss = self.loss_fn(z1, z2)
         
-        self.log('train_loss', loss, on_epoch=True, prog_bar=True)
+        self.log('train_loss', loss, on_epoch=True, prog_bar=True, on_step=True)
         return loss
     
     def validation_step(self, batch, batch_idx):

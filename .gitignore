@@ -6,3 +6,7 @@ slurm-*.err
 
 # Data folder
 data/
+
+quick_dl_weights.txt
+lightning_logs/
+checkpoints/

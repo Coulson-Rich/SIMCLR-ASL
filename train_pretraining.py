@@ -5,7 +5,7 @@ from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 import pickle
 
 from src.simclr_model import AUTSLDataset, MultimodalEncoder, SimCLRLightning
-from src.augmentations import ContrastiveTransform
+from src.augmentation import ContrastiveTransform
 
 
 def train_simclr():
@@ -24,7 +24,7 @@ def train_simclr():
     # Create dataloaders
     train_loader = DataLoader(
         train_dataset,
-        batch_size=32,
+        batch_size=8,
         shuffle=True,
         num_workers=4,
         pin_memory=True
@@ -32,7 +32,7 @@ def train_simclr():
     
     val_loader = DataLoader(
         val_dataset,
-        batch_size=32,
+        batch_size=8,
         shuffle=False,
         num_workers=4,
         pin_memory=True
@@ -43,14 +43,14 @@ def train_simclr():
         video_feature_dim=2048,
         pose_feature_dim=512,
         fusion_dim=2048,
-        pose_input_dim=132  # Adjust based on AUTSL pose format
+        pose_input_dim=2172  
     )
     
     model = SimCLRLightning(
         encoder=encoder,
         projection_dim=128,
-        learning_rate=3e-4,
-        temperature=0.07
+        learning_rate=1e-4,
+        temperature=0.5
     )
     
     # Callbacks
@@ -76,7 +76,9 @@ def train_simclr():
         devices=1,
         callbacks=[checkpoint_callback, early_stop_callback],
         log_every_n_steps=10,
-        default_root_dir='./lightning_logs'
+        default_root_dir='./lightning_logs',
+        gradient_clip_val=1.0,
+        gradient_clip_algorithm='norm'
     )
     
     # Train
